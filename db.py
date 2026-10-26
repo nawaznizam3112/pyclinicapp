@@ -13,6 +13,11 @@ STATUSES = ["Ordered", "Sent to lab", "In progress", "Result received", "Reviewe
 TEST_TYPES = ["OPG", "CBCT", "IOPA", "Bitewing", "Blood - HbA1c", "Blood - CBC", "Blood - BT/CT", "Biopsy", "Other"]
 URGENCY = ["Routine", "Urgent"]
 APPT_STATUSES = ["Scheduled", "Completed", "Cancelled", "No-show"]
+TREATMENT_STATUSES = ["Planned", "In progress", "Completed", "Declined"]
+PAY_METHODS = ["Cash", "UPI", "Card", "Bank transfer", "Insurance"]
+COMMON_PROCEDURES = ["Consultation", "Scaling & polishing", "Composite filling", "GIC filling", "Root canal treatment",
+                     "Crown (PFM)", "Crown (zirconia)", "Extraction - simple", "Extraction - surgical", "Implant",
+                     "Denture", "Orthodontic consultation", "Other"]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS patients (
@@ -42,6 +47,44 @@ CREATE TABLE IF NOT EXISTS lab_orders (
     result_path TEXT,
     result_summary TEXT,
     ordered_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    full_name TEXT NOT NULL,
+    role TEXT NOT NULL,
+    pw_hash TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    locked_until TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    username TEXT,
+    action TEXT NOT NULL,
+    entity TEXT,
+    entity_id INTEGER,
+    detail TEXT
+);
+CREATE TABLE IF NOT EXISTS treatments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_id INTEGER NOT NULL REFERENCES patients(id),
+    tooth TEXT,
+    procedure TEXT NOT NULL,
+    fee REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'Planned',
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_id INTEGER NOT NULL REFERENCES patients(id),
+    amount REAL NOT NULL,
+    method TEXT,
+    note TEXT,
+    at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS order_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,3 +182,136 @@ def order_history(order_id):
     with conn() as c:
         return [dict(r) for r in c.execute(
             "SELECT status, note, at FROM order_events WHERE order_id=? ORDER BY id", (order_id,))]
+
+
+# ---------- tooth notation (FDI) ----------
+_PERMANENT = {f"{q}{n}" for q in "1234" for n in "12345678"}
+_PRIMARY = {f"{q}{n}" for q in "5678" for n in "12345"}
+VALID_FDI = _PERMANENT | _PRIMARY
+
+
+def normalize_tooth(text: str) -> str:
+    """'' = whole mouth / general. Otherwise comma-separated FDI numbers, validated."""
+    parts = [p.strip() for p in text.replace(";", ",").split(",") if p.strip()]
+    bad = [p for p in parts if p not in VALID_FDI]
+    if bad:
+        raise ValueError(f"Not valid FDI tooth number(s): {', '.join(bad)}")
+    return ",".join(parts)
+
+
+# ---------- users ----------
+def count_users() -> int:
+    with conn() as c:
+        return c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def create_user(username, full_name, role, pw_hash):
+    with conn() as c:
+        c.execute("INSERT INTO users(username,full_name,role,pw_hash,created_at) VALUES(?,?,?,?,?)",
+                  (username.strip().lower(), full_name.strip(), role, pw_hash, _now()))
+
+
+def get_user(username):
+    with conn() as c:
+        r = c.execute("SELECT * FROM users WHERE username=?", (username.strip().lower(),)).fetchone()
+        return dict(r) if r else None
+
+
+def list_users():
+    with conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT id, username, full_name, role, active, created_at FROM users ORDER BY username")]
+
+
+def set_user_active(user_id, active: bool):
+    with conn() as c:
+        c.execute("UPDATE users SET active=? WHERE id=?", (1 if active else 0, user_id))
+
+
+def set_password(user_id, pw_hash):
+    with conn() as c:
+        c.execute("UPDATE users SET pw_hash=?, failed_count=0, locked_until=NULL WHERE id=?", (pw_hash, user_id))
+
+
+def record_login_failure(username, max_failed=5, lock_minutes=10):
+    from datetime import timedelta
+    with conn() as c:
+        c.execute("UPDATE users SET failed_count = failed_count + 1 WHERE username=?", (username.strip().lower(),))
+        r = c.execute("SELECT failed_count FROM users WHERE username=?", (username.strip().lower(),)).fetchone()
+        if r and r[0] >= max_failed:
+            until = (datetime.now() + timedelta(minutes=lock_minutes)).isoformat(timespec="seconds")
+            c.execute("UPDATE users SET locked_until=?, failed_count=0 WHERE username=?",
+                      (until, username.strip().lower()))
+
+
+def reset_login_failures(username):
+    with conn() as c:
+        c.execute("UPDATE users SET failed_count=0, locked_until=NULL WHERE username=?", (username.strip().lower(),))
+
+
+# ---------- audit ----------
+def log(actor, action, entity="", entity_id=None, detail=""):
+    with conn() as c:
+        c.execute("INSERT INTO audit_log(at,username,action,entity,entity_id,detail) VALUES(?,?,?,?,?,?)",
+                  (_now(), actor, action, entity, entity_id, detail))
+
+
+def list_audit(limit=500):
+    with conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT at, username, action, entity, entity_id, detail FROM audit_log ORDER BY id DESC LIMIT ?", (limit,))]
+
+
+# ---------- treatment plans ----------
+def add_treatment(patient_id, tooth, procedure, fee):
+    tooth = normalize_tooth(tooth)
+    if fee < 0:
+        raise ValueError("Fee cannot be negative")
+    with conn() as c:
+        cur = c.execute("INSERT INTO treatments(patient_id,tooth,procedure,fee,created_at) VALUES(?,?,?,?,?)",
+                        (patient_id, tooth, procedure, float(fee), _now()))
+        return cur.lastrowid
+
+
+def list_treatments(patient_id):
+    with conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM treatments WHERE patient_id=? ORDER BY id", (patient_id,))]
+
+
+def set_treatment_status(treatment_id, status):
+    with conn() as c:
+        done = _now() if status == "Completed" else None
+        c.execute("UPDATE treatments SET status=?, completed_at=? WHERE id=?", (status, done, treatment_id))
+
+
+# ---------- billing ----------
+def add_payment(patient_id, amount, method, note=""):
+    if amount <= 0:
+        raise ValueError("Payment must be greater than zero")
+    with conn() as c:
+        cur = c.execute("INSERT INTO payments(patient_id,amount,method,note,at) VALUES(?,?,?,?,?)",
+                        (patient_id, float(amount), method, note, _now()))
+        return cur.lastrowid
+
+
+def list_payments(patient_id):
+    with conn() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM payments WHERE patient_id=? ORDER BY id", (patient_id,))]
+
+
+def patient_balance(patient_id) -> dict:
+    """Billed = completed treatments only. Planned work is a quote, not a charge."""
+    with conn() as c:
+        billed = c.execute("SELECT COALESCE(SUM(fee),0) FROM treatments WHERE patient_id=? AND status='Completed'",
+                           (patient_id,)).fetchone()[0]
+        paid = c.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE patient_id=?", (patient_id,)).fetchone()[0]
+    return {"billed": billed, "paid": paid, "balance": billed - paid}
+
+
+def outstanding_total() -> float:
+    with conn() as c:
+        ids = [r[0] for r in c.execute("SELECT id FROM patients")]
+    return sum(max(patient_balance(i)["balance"], 0) for i in ids)
+
+
